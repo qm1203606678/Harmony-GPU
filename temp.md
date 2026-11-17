@@ -1,69 +1,56 @@
-**这版的大部分观察可以保留。必须修改的是“相关系数−0.029，可排除并发不足”这句话。**另外，流量不闭合的原因还不能直接定为统计边界不同。其余主要是措辞和方法前提的补充。
+SELECT
+    g.id AS track_id,
+    g.gpu_id,
+    g.name AS counter_name,
+    g.unit,
+    COUNT(c.id) AS sample_count
+FROM gpu_counter_track AS g
+LEFT JOIN counter AS c
+    ON c.track_id = g.id
+WHERE g.gpu_id = 0
+GROUP BY g.id, g.gpu_id, g.name, g.unit
+ORDER BY g.id;
 
-1. **Concurrent Warps与stall几乎不相关，不能排除并发不足。**
 
-   如果这里使用的是Pearson相关系数，−0.029只能说明当前样本中没有明显的**线性相关**。以下情况都可能使相关系数接近零：
 
-   - 并发度始终偏低，变化范围很小，但一直限制性能。
-   - 关系存在阈值或饱和区间，线性相关无法描述。
-   - 不同Shader、Compute与Rendering混合后，各组关系相互抵消。
-   - 已分配的warp很多，但它们同时等待数据，可立即执行的工作仍不足。
+-- 自动生成 GPU 0 全部 Counters 的宽表查询
+SELECT
+    'SELECT ROUND((c.ts - b.start_ts) / 1e9, 9) AS time_s, ' ||
 
-   华为将Concurrent Warps定义为每周期、每执行单元分配用于执行的平均线程束数；它没有直接提供“当前可立即发射指令的warp数量”。[官方定义](https://developer.huawei.com/consumer/cn/doc/Tools-Guides/gpu-counters-0000001886127538/)
+    (
+        SELECT GROUP_CONCAT(
+            'MAX(CASE WHEN c.track_id = ' || x.id ||
+            ' THEN c.value END) AS "' ||
+            REPLACE(
+                x.name || ' [track_' || x.id || ']',
+                '"', '""'
+            ) ||
+            '"',
+            ', '
+        )
+        FROM (
+            SELECT
+                g.id,
+                COALESCE(g.name, 'Unnamed Counter') ||
+                CASE
+                    WHEN g.unit IS NOT NULL AND g.unit <> ''
+                    THEN ' (' || g.unit || ')'
+                    ELSE ''
+                END AS name
+            FROM gpu_counter_track AS g
+            WHERE g.gpu_id = 0
+              AND EXISTS (
+                  SELECT 1
+                  FROM counter AS c
+                  WHERE c.track_id = g.id
+              )
+            ORDER BY g.id
+        ) AS x
+    ) ||
 
-   建议改成：
+    ' FROM counter AS c CROSS JOIN trace_bounds AS b ' ||
+    'WHERE c.track_id IN (' ||
+    'SELECT id FROM gpu_counter_track WHERE gpu_id = 0) ' ||
+    'GROUP BY c.ts ORDER BY c.ts;'
 
-   > 当前样本中，Concurrent Warps与stall未显示明显线性相关，尚不能判断并发度是否限制了延迟隐藏能力。
-
-   下一步只需在**同一主要任务、相近频率和工作规模**内检查这组关系，暂时无需扩展成大量新实验。
-
-2. **TU＋LSC不闭合，说明当前分解不能当作完整划分；尚未唯一确定原因。**
-
-   除统计边界不同外，遗漏来源、类别重叠、采样时间错位也可能产生差额。因此建议将“不是同一统计边界”改为：
-
-   > 当前数据不支持将TU与LSC作为总外部读取的完整、可加分解；具体原因尚未确认。
-
-   “低读量窗口偏差大、高读量窗口接近闭合”也值得保留：低读量的小分母会放大相对误差。除现有统计外，再补一个量就够了：
-
-   \[
-   E=\frac{\sum_i|B_{\mathrm{TU},i}+B_{\mathrm{LSC},i}-B_{\mathrm{Total},i}|}
-   {\sum_iB_{\mathrm{Total},i}}
-   \]
-
-   它能避免整段正负差额抵消，也不会让低流量窗口主导结果。
-
-   **89.82%仍是有价值的观察。**建议明确称为“当前计数器口径下，TU读量与总外部读量之比”。来源分解尚未闭合，会限制其物理解释，但不会自动否定这个比值。
-
-3. **时间部分保留“近乎固定比例”，删除“恒为”。**
-
-   你的拟合式含非零截距，因此：
-
-   \[
-   \frac{Duration}{dt}=0.347745+\frac{0.1232}{dt}
-   \]
-
-   数学上不是严格常数。可以写成“比值集中在约0.348附近”，并注明0.3481究竟是均值、中位数还是其他汇总值。
-
-   另外，阶段A/B的525/533μs说明采样节奏接近，**不能替代主动改变采样周期的A/B实验**。建议把“dt是采样定时器”改为“dt是相邻有效采样的实际时间间隔”，前提是这已经从生成代码中确认。
-
-4. **H加权和miss加权可以保留，但方法说明里各补一个前提。**
-
-   \(H_i=Duration_i\times ShaderCoreActive_i\) 能作为对应Shader活跃分母的前提是：两字段同窗、同统计范围、聚合方式一致，且Duration就是该比例所用的GPU活跃时长。比例按0～1代入。尚未确认这些条件时，应把H称为**代理权重**，不要赋予它额外的物理含义。
-
-   纹素计数已经覆盖采样窗口，所以不再乘dt，这个修正成立。
-
-   对分桶中的“每纹素外部读”，建议使用桶内：
-
-   \[
-   \frac{\sum B_i}{\sum n_i}
-   \]
-
-   并注明分子是**总外部读**还是**TU外部读**。前者包含其他读取，不能直接解释为一次纹理访问的成本。你现在对分桶共变因素的保留已经合适，无需把单调关系进一步解释为因果。
-
-5. **Coarse Z Discard的4.94%可保留，但应注明统计方法，去掉“仅”和“更可靠”。**
-
-   写清楚它是窗口中位数、时间加权均值，还是其他统计量。该指标描述的是binning阶段粗粒度深度测试的剔除比例，不能代表全部深度剔除、全部几何剔除或过度绘制。[华为帧级指标定义](https://developer.huawei.com/consumer/cn/doc/Tools-Guides/performance-counter-0000001807370140/)
-
-   低值本身既不证明剔除有缺陷，也不能说明剩余图元都是浪费。
-
-完成这些修改后，这份材料就可以作为**阶段性分析报告**使用。下一步最有价值的工作仍是两项：用独立执行事件验证Duration的物理含义；在实际耗时最大的任务内部，联合检查数据等待、纹理读取和并发情况。全局相关系数不宜继续承担“排除某种瓶颈”的作用。
+AS generated_sql;
